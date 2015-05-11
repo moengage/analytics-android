@@ -7,6 +7,7 @@ import android.os.Looper;
 import android.os.Message;
 import android.util.JsonWriter;
 import com.segment.analytics.internal.AbstractIntegration;
+import com.segment.analytics.internal.Utils.AnalyticsThreadFactory;
 import com.segment.analytics.internal.model.payloads.AliasPayload;
 import com.segment.analytics.internal.model.payloads.BasePayload;
 import com.segment.analytics.internal.model.payloads.GroupPayload;
@@ -27,6 +28,9 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import static android.os.Process.THREAD_PRIORITY_BACKGROUND;
 import static com.segment.analytics.internal.Utils.THREAD_PREFIX;
@@ -59,18 +63,18 @@ class SegmentDispatcher extends AbstractIntegration {
    * {@code integrations} and json tokens.
    */
   private static final int MAX_BATCH_SIZE = 475000; // 475kb
-  final Context context;
-  final QueueFile queueFile;
-  final Client client;
-  final long flushIntervalInMillis;
-  final int flushQueueSize;
-  final Stats stats;
-  final Handler handler;
-  final HandlerThread segmentThread;
-  final Analytics.LogLevel logLevel;
-  final Map<String, Boolean> bundledIntegrations;
-  final Cartographer cartographer;
+  private final Context context;
+  private final QueueFile queueFile;
+  private final Client client;
+  private final int flushQueueSize;
+  private final Stats stats;
+  private final Handler handler;
+  private final HandlerThread segmentThread;
+  private final Analytics.LogLevel logLevel;
+  private final Map<String, Boolean> bundledIntegrations;
+  private final Cartographer cartographer;
   private final ExecutorService networkExecutor;
+  private final ScheduledExecutorService flushScheduler;
 
   /**
    * Create a {@link QueueFile} in the given folder with the given name. This method will throw an
@@ -119,18 +123,19 @@ class SegmentDispatcher extends AbstractIntegration {
     this.logLevel = logLevel;
     this.bundledIntegrations = bundledIntegrations;
     this.cartographer = cartographer;
-    this.flushIntervalInMillis = flushIntervalInMillis;
     this.flushQueueSize = flushQueueSize;
+    this.flushScheduler = Executors.newScheduledThreadPool(1, new AnalyticsThreadFactory());
 
     segmentThread = new HandlerThread(SEGMENT_THREAD_NAME, THREAD_PRIORITY_BACKGROUND);
     segmentThread.start();
     handler = new SegmentDispatcherHandler(segmentThread.getLooper(), this);
 
-    if (queueFile.size() >= flushQueueSize) {
-      flush();
-    } else {
-      scheduleFlush();
-    }
+    long initialDelay = queueFile.size() >= flushQueueSize ? 0L : flushIntervalInMillis;
+    flushScheduler.scheduleAtFixedRate(new Runnable() {
+      @Override public void run() {
+        flush();
+      }
+    }, initialDelay, flushIntervalInMillis, TimeUnit.MILLISECONDS);
   }
 
   @Override public void initialize(Analytics analytics, ValueMap settings)
@@ -206,11 +211,6 @@ class SegmentDispatcher extends AbstractIntegration {
     handler.sendMessage(handler.obtainMessage(SegmentDispatcherHandler.REQUEST_FLUSH));
   }
 
-  void scheduleFlush() {
-    handler.sendMessageDelayed(handler.obtainMessage(SegmentDispatcherHandler.REQUEST_FLUSH),
-        flushIntervalInMillis);
-  }
-
   private int upload() throws IOException {
     Client.Connection connection = null;
     try {
@@ -244,7 +244,6 @@ class SegmentDispatcher extends AbstractIntegration {
 
   void performFlush() {
     if (queueFile.size() < 1 || !isConnected(context)) {
-      scheduleFlush();
       return;
     }
 
@@ -270,10 +269,9 @@ class SegmentDispatcher extends AbstractIntegration {
         throw e;
       }
 
+      stats.dispatchFlush(payloadsUploaded);
       if (queueFile.size() > 0) {
         performFlush(); // Flush any remaining items.
-      } else {
-        scheduleFlush();
       }
     } catch (InterruptedException e) {
       if (logLevel.log()) {
@@ -283,11 +281,11 @@ class SegmentDispatcher extends AbstractIntegration {
       if (logLevel.log()) {
         error(e, "Could not upload payloads.");
       }
-      scheduleFlush();
     }
   }
 
   void shutdown() {
+    flushScheduler.shutdown();
     segmentThread.quit();
     closeQuietly(queueFile);
   }

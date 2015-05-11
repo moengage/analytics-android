@@ -168,7 +168,6 @@ public class SegmentDispatcherTest {
     segmentDispatcher.performFlush();
 
     verify(client, never()).upload();
-    assertThat(segmentDispatcher.handler.hasMessages(REQUEST_FLUSH)).isTrue();
   }
 
   @Test public void flushWhenQueueSizeIsLessThanOneSkipsUpload() throws IOException {
@@ -183,7 +182,6 @@ public class SegmentDispatcherTest {
 
     verifyZeroInteractions(context);
     verify(client, never()).upload();
-    assertThat(segmentDispatcher.handler.hasMessages(REQUEST_FLUSH)).isTrue();
   }
 
   @Test public void flushDisconnectsConnection() throws IOException {
