@@ -25,12 +25,12 @@ import java.io.OutputStreamWriter;
 import java.nio.charset.Charset;
 import java.util.Date;
 import java.util.Map;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static android.os.Process.THREAD_PRIORITY_BACKGROUND;
 import static com.segment.analytics.internal.Utils.THREAD_PREFIX;
@@ -75,6 +75,8 @@ class SegmentDispatcher extends AbstractIntegration {
   private final Cartographer cartographer;
   private final ExecutorService networkExecutor;
   private final ScheduledExecutorService flushScheduler;
+  // Lock to ensure that when we're uploading payloads, we don't remove any from QueueFile
+  private final Lock queueFileLock;
 
   /**
    * Create a {@link QueueFile} in the given folder with the given name. This method will throw an
@@ -125,6 +127,7 @@ class SegmentDispatcher extends AbstractIntegration {
     this.cartographer = cartographer;
     this.flushQueueSize = flushQueueSize;
     this.flushScheduler = Executors.newScheduledThreadPool(1, new AnalyticsThreadFactory());
+    this.queueFileLock = new ReentrantLock();
 
     segmentThread = new HandlerThread(SEGMENT_THREAD_NAME, THREAD_PRIORITY_BACKGROUND);
     segmentThread.start();
@@ -173,13 +176,20 @@ class SegmentDispatcher extends AbstractIntegration {
 
   void performEnqueue(BasePayload payload) {
     if (queueFile.size() >= MAX_QUEUE_SIZE) {
-      if (logLevel.log()) {
-        debug("Queue is at max capacity (%s), removing oldest event.", queueFile.size());
-      }
-      try {
-        queueFile.remove();
-      } catch (IOException e) {
-        throw new IOError(e);
+      queueFileLock.lock();
+      // Double checked locking, the network executor could have removed events from the queue
+      // while we were waiting.
+      if (queueFile.size() >= MAX_QUEUE_SIZE) {
+        if (logLevel.log()) {
+          debug("Queue is at max capacity (%s), removing oldest payload.", queueFile.size());
+        }
+        try {
+          queueFile.remove();
+        } catch (IOException e) {
+          throw new IOError(e);
+        } finally {
+          queueFileLock.unlock();
+        }
       }
     }
 
@@ -203,84 +213,93 @@ class SegmentDispatcher extends AbstractIntegration {
       if (logLevel.log()) {
         debug("Queue size (%s) has triggered flush.", payload, queueFile.size());
       }
-      performFlush();
+      submitFlush();
     }
   }
 
+  /** Enqueues a flush message to the handler. */
   @Override public void flush() {
     handler.sendMessage(handler.obtainMessage(SegmentDispatcherHandler.REQUEST_FLUSH));
   }
 
-  private int upload() throws IOException {
-    Client.Connection connection = null;
-    try {
-      // Open a connection.
-      connection = client.upload();
-
-      // Write the payloads into the OutputStream.
-      BatchPayloadWriter writer = new BatchPayloadWriter(connection.os).beginObject()
-          .integrations(bundledIntegrations)
-          .beginBatchArray();
-      PayloadWriter payloadWriter = new PayloadWriter(writer);
-      queueFile.forEach(payloadWriter);
-      writer.endBatchArray().endObject().close();
-      // Don't use the result of QueueFiles#forEach, since we may not read the last element.
-      int payloadsUploaded = payloadWriter.payloadCount;
-
-      try {
-        // Upload the payloads.
-        connection.close();
-      } catch (Client.UploadException e) {
-        // Simply log and proceed to remove the rejected payloads from the queue
-        if (logLevel.log()) {
-          error(e, "Payloads were rejected by server.");
-        }
-      }
-      return payloadsUploaded;
-    } finally {
-      closeQuietly(connection);
-    }
-  }
-
-  void performFlush() {
+  /** Submits a flush message to the network executor. */
+  void submitFlush() {
     if (queueFile.size() < 1 || !isConnected(context)) {
       return;
     }
 
+    networkExecutor.submit(new Runnable() {
+      @Override public void run() {
+        queueFileLock.lock();
+        try {
+          performFlush();
+        } finally {
+          queueFileLock.unlock();
+        }
+      }
+    });
+  }
+
+  /** Upload payloads to our servers and remove them from the queue file. */
+  private void performFlush() {
+    if (logLevel.log()) {
+      debug("Uploading payloads. Queue size is %s.", queueFile.size());
+    }
+    int payloadsUploaded;
     try {
-      int payloadsUploaded = networkExecutor.submit(new Callable<Integer>() {
-        @Override public Integer call() throws Exception {
-          return upload();
-        }
-      }).get();
-
+      Client.Connection connection = null;
       try {
-        queueFile.remove(payloadsUploaded);
-      } catch (IOException e) {
-        IOException ioException = new IOException("Unable to remove " //
-            + payloadsUploaded + " payload(s) from queueFile: " + queueFile, e);
-        throw new IOError(ioException);
-      } catch (ArrayIndexOutOfBoundsException e) {
-        // Log more information for https://github.com/segmentio/analytics-android/issues/263
-        if (logLevel.log()) {
-          error(e, "Unable to remove %s payload(s) from queueFile: %s", payloadsUploaded,
-              queueFile);
-        }
-        throw e;
-      }
+        // Open a connection.
+        connection = client.upload();
 
-      stats.dispatchFlush(payloadsUploaded);
-      if (queueFile.size() > 0) {
-        performFlush(); // Flush any remaining items.
+        // Write the payloads into the OutputStream.
+        BatchPayloadWriter writer = new BatchPayloadWriter(connection.os).beginObject()
+            .integrations(bundledIntegrations)
+            .beginBatchArray();
+        PayloadWriter payloadWriter = new PayloadWriter(writer);
+        queueFile.forEach(payloadWriter);
+        writer.endBatchArray().endObject().close();
+        // Don't use the result of QueueFiles#forEach, since we may not read the last element.
+        payloadsUploaded = payloadWriter.payloadCount;
+
+        try {
+          // Upload the payloads.
+          connection.close();
+        } catch (Client.UploadException e) {
+          // Simply log and proceed to remove the rejected payloads from the queue
+          if (logLevel.log()) {
+            error(e, "Payloads were rejected by server. Marked for removal.");
+          }
+        }
+      } finally {
+        closeQuietly(connection);
       }
-    } catch (InterruptedException e) {
+    } catch (IOException e) {
       if (logLevel.log()) {
-        error(e, "Thread interrupted while waiting for flush.");
+        error(e, "Error while uploading payloads");
       }
-    } catch (ExecutionException e) {
-      if (logLevel.log()) {
-        error(e, "Could not upload payloads.");
-      }
+      return;
+    }
+
+    try {
+      queueFile.remove(payloadsUploaded);
+    } catch (IOException e) {
+      IOException ioException = new IOException("Unable to remove " //
+          + payloadsUploaded + " payload(s) from queueFile: " + queueFile, e);
+      throw new IOError(ioException);
+    } catch (ArrayIndexOutOfBoundsException e) {
+      // Log more information for https://github.com/segmentio/analytics-android/issues/263
+      // Don't worry about wrapping in a check
+      error(e, "Unable to remove %s payload(s) from queueFile: %s", payloadsUploaded, queueFile);
+      throw e;
+    }
+
+    if (logLevel.log()) {
+      debug("Uploaded %s payloads. Queue size is now %s.", payloadsUploaded, queueFile.size());
+    }
+    stats.dispatchFlush(payloadsUploaded);
+    if (queueFile.size() > 0) {
+      submitFlush(); // Flush any remaining items.
     }
   }
 
@@ -403,7 +422,7 @@ class SegmentDispatcher extends AbstractIntegration {
           segmentDispatcher.performEnqueue(payload);
           break;
         case REQUEST_FLUSH:
-          segmentDispatcher.performFlush();
+          segmentDispatcher.submitFlush();
           break;
         default:
           throw new AssertionError("Unknown dispatcher message: " + msg.what);
