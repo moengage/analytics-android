@@ -75,7 +75,30 @@ class SegmentDispatcher extends AbstractIntegration {
   private final Cartographer cartographer;
   private final ExecutorService networkExecutor;
   private final ScheduledExecutorService flushScheduler;
-  // Lock to ensure that when we're uploading payloads, we don't remove any from QueueFile
+  /**
+   * We don't want to stop adding payloads to our disk queue when we're uploading payloads. So we
+   * upload payloads on a network executor instead.
+   * <p/>
+   * Given:
+   * 1. Peek returns the oldest elements
+   * 2. Writes append to the tail of the queue
+   * 3. Methods on QueueFile are synchronized (so only thread can access it at a time)
+   * <p/>
+   * We offload flushes to the network executor, read the QueueFile and remove entries on it, while
+   * we continue to add payloads to the QueueFile on the default Dispatcher thread.
+   * <p/>
+   * We could end up in a case where (assuming MAX_QUEUE_SIZE is 10):
+   * 1. Executor reads 10 payloads from the QueueFile
+   * 2. Dispatcher is told to add an payloads (the 11th) to the queue.
+   * 3. Dispatcher sees that the queue size is at it's limit (10).
+   * 4. Dispatcher removes an payloads.
+   * 5. Dispatcher adds a payload.
+   * 6. Executor finishes uploading 10 payloads and proceeds to remove 10 elements from the file.
+   * Since the dispatcher already removed the 10th element and added the 11th, this would delete
+   * the 11th payload that never gets updated.
+   * <p/>
+   * To ensure that the Dispatcher thread doesn't remove when we're uploading, we use this lock.
+   */
   private final Lock queueFileLock;
 
   /**
@@ -176,10 +199,10 @@ class SegmentDispatcher extends AbstractIntegration {
 
   void performEnqueue(BasePayload payload) {
     if (queueFile.size() >= MAX_QUEUE_SIZE) {
-      queueFileLock.lock();
-      // Double checked locking, the network executor could have removed events from the queue
-      // while we were waiting.
+      queueFileLock.lock(); // todo: timeout and drop the payload?
       if (queueFile.size() >= MAX_QUEUE_SIZE) {
+        // Double checked locking, the network executor could have removed payload from the queue
+        // to bring it below our capacity while we were waiting.
         if (logLevel.log()) {
           debug("Queue is at max capacity (%s), removing oldest payload.", queueFile.size());
         }
@@ -190,6 +213,8 @@ class SegmentDispatcher extends AbstractIntegration {
         } finally {
           queueFileLock.unlock();
         }
+      } else {
+        queueFileLock.unlock();
       }
     }
 

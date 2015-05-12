@@ -153,7 +153,7 @@ public class AnalyticsBuilderTest {
 
     try {
       new Builder(context, stubbedKey).flushQueueSize(251);
-      fail("flushQueueSize = 501 should throw exception.");
+      fail("flushQueueSize = 251 should throw exception.");
     } catch (IllegalArgumentException expected) {
       assertThat(expected).hasMessage("flushQueueSize must be less than or equal to 250.");
     }
